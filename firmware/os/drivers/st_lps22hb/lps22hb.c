@@ -23,6 +23,7 @@
 #include <plat/syscfg.h>
 #include <sensors.h>
 #include <seos.h>
+#include <slab.h>
 #include <i2c.h>
 #include <timer.h>
 #include <stdlib.h>
@@ -54,12 +55,6 @@
 #define LPS22HB_PRESS_OUTXL_REG_ADDR    0x28
 #define LPS22HB_TEMP_OUTL_REG_ADDR      0x2B
 
-#define LPS22HB_INT1_REG_ADDR           0x23
-#define LPS22HB_INT2_REG_ADDR           0x24
-
-#define LPS22HB_INT1_PIN                GPIO_PA(4)
-#define LPS22HB_INT2_PIN                GPIO_PB(0)
-
 #define LPS22HB_HECTO_PASCAL(baro_val)  (baro_val/4096)
 #define LPS22HB_CENTIGRADES(temp_val)   (temp_val/100)
 
@@ -88,7 +83,6 @@
 enum lps22hbSensorEvents
 {
     EVT_COMM_DONE = EVT_APP_START + 1,
-    EVT_INT1_RAISED,
     EVT_SENSOR_BARO_TIMER,
     EVT_SENSOR_TEMP_TIMER,
     EVT_TEST,
@@ -97,7 +91,6 @@ enum lps22hbSensorEvents
 enum lps22hbSensorState {
     SENSOR_BOOT,
     SENSOR_VERIFY_ID,
-    SENSOR_INIT,
     SENSOR_BARO_POWER_UP,
     SENSOR_BARO_POWER_DOWN,
     SENSOR_TEMP_POWER_UP,
@@ -132,6 +125,7 @@ struct lps22hbSensor {
 
 #define LPS22HB_MAX_PENDING_I2C_REQUESTS   4
 #define LPS22HB_MAX_I2C_TRANSFER_SIZE      6
+#define LPS22HB_MAX_BARO_EVENTS            4
 
 struct I2cTransfer
 {
@@ -146,6 +140,8 @@ struct I2cTransfer
 /* Task structure */
 struct lps22hbTask {
     uint32_t tid;
+
+    struct SlabAllocator *baroSlab;
 
     /* timer */
     uint32_t baroTimerHandle;
@@ -172,6 +168,29 @@ struct lps22hbTask {
 };
 
 static struct lps22hbTask mTask;
+
+static bool baroAllocateEvt(struct SingleAxisDataEvent **evPtr, float sample, uint64_t time)
+{
+    struct SingleAxisDataEvent *ev;
+
+    ev = *evPtr = slabAllocatorAlloc(mTask.baroSlab);
+    if (!ev) {
+        ERROR_PRINT("Failed to allocate baro evt memory");
+        return false;
+    }
+
+    memset(&ev->samples[0].firstSample, 0x00, sizeof(struct SensorFirstSample));
+    ev->referenceTime = time;
+    ev->samples[0].firstSample.numSamples = 1;
+    ev->samples[0].fdata = sample;
+
+    return true;
+}
+
+static void baroFreeEvt(void *ptr)
+{
+    slabAllocatorFree(mTask.baroSlab, ptr);
+}
 
 // Allocate a buffer and mark it as in use with the given state, or return NULL
 // if no buffers available. Must *not* be called from interrupt context.
@@ -288,7 +307,7 @@ static const uint64_t lps22hbRatesRateVals[] =
 
 static const struct SensorInfo lps22hbSensorInfo[NUM_OF_SENSOR] =
 {
-    { DEC_INFO("Pressure", SENS_TYPE_BARO, NUM_AXIS_EMBEDDED, NANOHUB_INT_NONWAKEUP,
+    { DEC_INFO("Pressure", SENS_TYPE_BARO, NUM_AXIS_ONE, NANOHUB_INT_NONWAKEUP,
         300, lps22hbRates, 0, 0, 0) },
     { DEC_INFO("Temperature", SENS_TYPE_TEMP, NUM_AXIS_EMBEDDED, NANOHUB_INT_NONWAKEUP,
         20, lps22hbRates, 0, 0, 0) },
@@ -404,7 +423,7 @@ static bool tempSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
 static bool tempFlush(void *cookie)
 {
-    return osEnqueueEvt(sensorGetMyEventType(SENS_TYPE_BARO), SENSOR_DATA_EVENT_FLUSH, NULL);
+    return osEnqueueEvt(sensorGetMyEventType(SENS_TYPE_TEMP), SENSOR_DATA_EVENT_FLUSH, NULL);
 }
 
 #define DEC_OPS(power, firmware, rate, flush, cal, cfg) \
@@ -421,16 +440,16 @@ static const struct SensorOps lps22hbSensorOps[NUM_OF_SENSOR] =
     { DEC_OPS(tempPower, tempFwUpload, tempSetRate, tempFlush, NULL, NULL) },
 };
 
-static uint8_t *baro_samples;
-static uint8_t *temp_samples;
 static int handleCommDoneEvt(const void* evtData)
 {
     uint8_t i;
     int baro_val;
     short temp_val;
     //uint32_t state = (uint32_t)evtData;
+    struct SingleAxisDataEvent *baroSample;
     union EmbeddedDataPoint sample;
     struct I2cTransfer *xfer = (struct I2cTransfer *)evtData;
+    uint8_t *ptr_samples;
 
     switch (xfer->state) {
     case SENSOR_BOOT:
@@ -456,11 +475,6 @@ static int handleCommDoneEvt(const void* evtData)
         //osEnqueuePrivateEvt(EVT_TEST, NULL, NULL, mTask.tid);
         break;
 
-    case SENSOR_INIT:
-        for (i = 0; i < NUM_OF_SENSOR; i++)
-            sensorRegisterInitComplete(mTask.sensors[i].handle);
-        break;
-
     case SENSOR_BARO_POWER_UP:
         sensorSignalInternalEvt(mTask.sensors[BARO].handle,
                     SENSOR_INTERNAL_EVT_POWER_STATE_CHG, true, 0);
@@ -483,25 +497,27 @@ static int handleCommDoneEvt(const void* evtData)
 
     case SENSOR_READ_SAMPLES:
         if (mTask.baroOn && mTask.baroWantRead) {
-            mTask.baroWantRead = false;
-            baro_samples = xfer->txrxBuf;
+            float pressure_hPa;
 
-            baro_val = ((baro_samples[2] << 16) & 0xff0000) |
-                    ((baro_samples[1] << 8) & 0xff00) |
-                    (baro_samples[0]);
+            mTask.baroWantRead = false;
+            ptr_samples = xfer->txrxBuf;
+
+            baro_val = ((ptr_samples[2] << 16) & 0xff0000) |
+                       ((ptr_samples[1] << 8) & 0xff00) | (ptr_samples[0]);
 
             mTask.baroReading = false;
-            sample.fdata = LPS22HB_HECTO_PASCAL((float)baro_val);
+            pressure_hPa = LPS22HB_HECTO_PASCAL((float)baro_val);
             //osLog(LOG_INFO, "baro: %p\n", sample.vptr);
-            osEnqueueEvt(sensorGetMyEventType(SENS_TYPE_BARO), sample.vptr, NULL);
+            if (baroAllocateEvt(&baroSample, pressure_hPa, sensorGetTime())) {
+                osEnqueueEvtOrFree(sensorGetMyEventType(SENS_TYPE_BARO), baroSample, baroFreeEvt);
+            }
         }
 
         if (mTask.tempOn && mTask.tempWantRead) {
             mTask.tempWantRead = false;
-            temp_samples = &xfer->txrxBuf[3];
+            ptr_samples = &xfer->txrxBuf[3];
 
-            temp_val  = ((temp_samples[1] << 8) & 0xff00) |
-                    (temp_samples[0]);
+            temp_val  = ((ptr_samples[1] << 8) & 0xff00) | (ptr_samples[0]);
 
             mTask.tempReading = false;
             sample.fdata = LPS22HB_CENTIGRADES((float)temp_val);
@@ -564,10 +580,6 @@ static void handleEvent(uint32_t evtType, const void* evtData)
 
         break;
 
-    case EVT_INT1_RAISED:
-        INFO_PRINT("EVT_INT1_RAISED\n");
-        break;
-
     case EVT_TEST:
         INFO_PRINT("EVT_TEST\n");
 
@@ -586,6 +598,7 @@ static void handleEvent(uint32_t evtType, const void* evtData)
 static bool startTask(uint32_t task_id)
 {
     uint8_t i;
+    size_t slabSize;
 
     mTask.tid = task_id;
 
@@ -593,6 +606,14 @@ static bool startTask(uint32_t task_id)
 
     mTask.baroOn = mTask.tempOn = false;
     mTask.baroReading = mTask.tempReading = false;
+
+    slabSize = sizeof(struct SingleAxisDataEvent) + sizeof(struct SingleAxisDataPoint);
+
+    mTask.baroSlab = slabAllocatorNew(slabSize, 4, LPS22HB_MAX_BARO_EVENTS);
+    if (!mTask.baroSlab) {
+        ERROR_PRINT("Failed to allocate baroSlab memory\n");
+        return false;
+    }
 
     /* Init the communication part */
     i2cMasterRequest(LPS22HB_I2C_BUS_ID, LPS22HB_I2C_SPEED);
@@ -613,6 +634,7 @@ static bool startTask(uint32_t task_id)
 static void endTask(void)
 {
     INFO_PRINT("task ended\n");
+    slabAllocatorDestroy(mTask.baroSlab);
 }
 
 INTERNAL_APP_INIT(LPS22HB_APP_ID, 0, startTask, endTask, handleEvent);
