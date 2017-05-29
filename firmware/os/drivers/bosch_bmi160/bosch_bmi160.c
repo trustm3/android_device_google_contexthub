@@ -1,4 +1,3 @@
-
 /*
  * Copyright (C) 2016 The Android Open Source Project
  *
@@ -64,9 +63,9 @@
 #include <calibration/gyroscope/gyro_cal.h>
 #endif  // GYRO_CAL_ENABLED
 
-#ifdef GYRO_CAL_DBG_ENABLED
+#if defined(GYRO_CAL_DBG_ENABLED) || defined(OVERTEMPCAL_DBG_ENABLED)
 #include <calibration/util/cal_log.h>
-#endif  // GYRO_CAL_DBG_ENABLED
+#endif  // GYRO_CAL_DBG_ENABLED || OVERTEMPCAL_DBG_ENABLED
 
 #ifdef OVERTEMPCAL_ENABLED
 #include <calibration/over_temp/over_temp_cal.h>
@@ -104,7 +103,7 @@
 #define DBG_WM_CALC               0
 #define TIMESTAMP_DBG             0
 
-#define BMI160_APP_VERSION 14
+#define BMI160_APP_VERSION 15
 
 // fixme: to list required definitions for a slave mag
 #ifdef USE_BMM150
@@ -287,7 +286,8 @@
 #define MAG_MAX_RATE    11
 #define ACC_MAX_OSR     3
 #define GYR_MAX_OSR     4
-#define OSR_THRESHOLD   8
+#define ODR_100HZ       8
+#define ODR_200HZ       9
 
 #define MOTION_ODR         7
 
@@ -457,6 +457,7 @@ struct OtcGyroUpdateBuffer {
     struct AppToSensorHalDataBuffer head;
     struct GyroOtcData data;
     volatile uint8_t lock; // lock for static object
+    bool sendToHostRequest;
 } __attribute__((packed));
 
 struct BMI160Task {
@@ -1594,6 +1595,7 @@ static bool accSetRate(uint32_t rate, uint64_t latency, void *cookie)
 {
     TDECL();
     int odr, osr = 0;
+    int osr_mode = 2; // normal
 
     // change this to DEBUG_PRINT as there will be frequent (un)subscribings
     // to accel with different rate/latency requirements.
@@ -1618,7 +1620,13 @@ static bool accSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // for high odrs, oversample to reduce hw latency and downsample
         // to get desired odr
-        if (odr > OSR_THRESHOLD) {
+        if (odr > ODR_100HZ) {
+            // 200Hz osr4, >= 400Hz osr2
+            if (odr == ODR_200HZ) {
+                osr_mode = 0; // OSR4
+            } else {
+                osr_mode = 1; // OSR2
+            }
             osr = (ACC_MAX_OSR + odr) > ACC_MAX_RATE ? (ACC_MAX_RATE - odr) : ACC_MAX_OSR;
             odr += osr;
         }
@@ -1633,7 +1641,7 @@ static bool accSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // set ACC bandwidth parameter to 2 (bits[4:6])
         // set the rate (bits[0:3])
-        SPI_WRITE(BMI160_REG_ACC_CONF, 0x20 | odr);
+        SPI_WRITE(BMI160_REG_ACC_CONF, (osr_mode << 4) | odr);
 
         // configure down sampling ratio, 0x88 is to specify we are using
         // filtered samples
@@ -1656,6 +1664,7 @@ static bool gyrSetRate(uint32_t rate, uint64_t latency, void *cookie)
 {
     TDECL();
     int odr, osr = 0;
+    int osr_mode = 2; // normal
     INFO_PRINT("gyrSetRate: rate=%ld, latency=%lld, state=%" PRI_STATE "\n",
                rate, latency, getStateName(GET_STATE()));
 
@@ -1677,7 +1686,13 @@ static bool gyrSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // for high odrs, oversample to reduce hw latency and downsample
         // to get desired odr
-        if (odr > OSR_THRESHOLD) {
+        if (odr > ODR_100HZ) {
+            // 200Hz osr4, >= 400Hz osr2
+            if (odr == ODR_200HZ) {
+                osr_mode = 0; // OSR4
+            } else {
+                osr_mode = 1; // OSR2
+            }
             osr = (GYR_MAX_OSR + odr) > GYR_MAX_RATE ? (GYR_MAX_RATE - odr) : GYR_MAX_OSR;
             odr += osr;
         }
@@ -1689,7 +1704,7 @@ static bool gyrSetRate(uint32_t rate, uint64_t latency, void *cookie)
 
         // set GYR bandwidth parameter to 2 (bits[4:6])
         // set the rate (bits[0:3])
-        SPI_WRITE(BMI160_REG_GYR_CONF, 0x20 | odr);
+        SPI_WRITE(BMI160_REG_GYR_CONF, (osr_mode << 4) | odr);
 
         // configure down sampling ratio, 0x88 is to specify we are using
         // filtered samples
@@ -2192,18 +2207,24 @@ static void parseRawData(struct BMI160Sensor *mSensor, uint8_t *buf, float kScal
       // update checks.
       static uint64_t imu_new_otc_offset_timer = 0;  // nanoseconds
       bool new_otc_offset_update = false;
+      bool new_otc_model_update = false;
       if ((rtc_time - imu_new_otc_offset_timer) >= 500000000) {
         imu_new_otc_offset_timer = rtc_time;
 
         // OTC-Gyro Cal --  Gets the latest OTC-Gyro temperature compensated
         // offset estimate.
         new_otc_offset_update =
-            overTempCalGetOffset(&mTask.over_temp_gyro_cal, rtc_time,
-                                 &gyro_offset_temperature_celsius, gyro_offset);
+            overTempCalNewOffsetAvailable(&mTask.over_temp_gyro_cal);
+        overTempCalGetOffset(&mTask.over_temp_gyro_cal,
+                             &gyro_offset_temperature_celsius, gyro_offset);
+
+        // OTC-Gyro Cal --  Checks for a model update.
+        new_otc_model_update =
+            overTempCalNewModelUpdateAvailable(&mTask.over_temp_gyro_cal);
       }
 
       if (new_otc_offset_update) {
-#else  // OVERTEMPCAL_ENABLED
+#else   // OVERTEMPCAL_ENABLED
       if (new_gyrocal_offset_update) {
 #endif  // OVERTEMPCAL_ENABLED
         if (mSensor->data_evt->samples[0].firstSample.numSamples > 0) {
@@ -2243,10 +2264,9 @@ static void parseRawData(struct BMI160Sensor *mSensor, uint8_t *buf, float kScal
         }
       }
 #ifdef OVERTEMPCAL_ENABLED
-      if (overTempCalNewModelUpdateAvailable(&mTask.over_temp_gyro_cal)
-          || new_otc_offset_update) {
+      if (new_otc_model_update || new_otc_offset_update) {
         // Notify HAL to store new gyro OTC-Gyro data.
-        sendOtcGyroUpdate();
+        T(otcGyroUpdateBuffer).sendToHostRequest = true;
       }
 #endif  // OVERTEMPCAL_ENABLED
     }
@@ -3201,8 +3221,9 @@ static bool magCfgData(void *data, void *cookie)
                 (int)(d->inclination * 180 / M_PI + 0.5f));
 
         // Passing local field information to mag calibration routine
+#ifdef DIVERSITY_CHECK_ENABLED
         diversityCheckerLocalFieldUpdate(&mTask.moc.diversity_checker, d->strength);
-
+#endif
         // TODO: pass local field information to rotation vector sensor.
     } else {
         ERROR_PRINT("magCfgData: unknown type 0x%04x, size %d", p->type, p->size);
@@ -3323,6 +3344,13 @@ static void processPendingEvt(void)
         mTask.pending_calibration_save = !saveCalibration();
         return;
     }
+
+#ifdef OVERTEMPCAL_ENABLED
+    // tasks that do not initiate SPI transaction
+    if (T(otcGyroUpdateBuffer).sendToHostRequest) {
+        sendOtcGyroUpdate();
+    }
+#endif
 }
 
 static void sensorInit(void)
@@ -3825,56 +3853,62 @@ static bool startTask(uint32_t task_id)
 
 #ifdef GYRO_CAL_ENABLED
     // Gyro Cal -- Initialization.
-    gyroCalInit(&mTask.gyro_cal,
-                5e9,      // min stillness period = 5 seconds
-                6e9,      // max stillness period = 6 seconds
-                0, 0, 0,  // initial bias offset calibration
-                0,        // time stamp of initial bias calibration
-                1.5e9,    // analysis window length = 1.5 seconds
-                7.5e-5f,  // gyroscope variance threshold [rad/sec]^2
-                1e-5f,    // gyroscope confidence delta [rad/sec]^2
-                8e-3f,    // accelerometer variance threshold [m/sec^2]^2
-                1.6e-3f,  // accelerometer confidence delta [m/sec^2]^2
-                5.0f,     // magnetometer variance threshold [uT]^2
-                0.25,     // magnetometer confidence delta [uT]^2
-                0.95f,    // stillness threshold [0,1]
-                40.0e-3f * M_PI / 180.0f,  // stillness mean variation limit [rad/sec]
-                1.5f,     // maximum temperature deviation during stillness [C]
-                true);    // gyro calibration enable
+    gyroCalInit(
+        &mTask.gyro_cal,
+        5e9,                       // min stillness period = 5 seconds
+        6e9,                       // max stillness period = 6 seconds
+        0, 0, 0,                   // initial bias offset calibration
+        0,                         // time stamp of initial bias calibration
+        1.5e9,                     // analysis window length = 1.5 seconds
+        7.5e-5f,                   // gyroscope variance threshold [rad/sec]^2
+        1.5e-5f,                   // gyroscope confidence delta [rad/sec]^2
+        4.5e-3f,                   // accelerometer variance threshold [m/sec^2]^2
+        9.0e-4f,                   // accelerometer confidence delta [m/sec^2]^2
+        5.0f,                      // magnetometer variance threshold [uT]^2
+        1.0f,                      // magnetometer confidence delta [uT]^2
+        0.95f,                     // stillness threshold [0,1]
+        40.0e-3f * M_PI / 180.0f,  // stillness mean variation limit [rad/sec]
+        1.5f,                      // maximum temperature deviation during stillness [C]
+        true);                     // gyro calibration enable
 
 #ifdef OVERTEMPCAL_ENABLED
     // Initialize over-temp calibration.
     overTempCalInit(
         &mTask.over_temp_gyro_cal,
-        5,                          // Min num of points to enable model update.
-        5000000000,                 // Min model update interval [nsec].
-        0.75f,                      // Temperature span of bin method [C].
-        50.0e-3f * M_PI / 180.0f,   // Model fit tolerance [rad/sec].
-        172800000000000,            // Model data point age limit [nsec].
-        50.0e-3f * M_PI / 180.0f,   // Limit for temp. sensitivity [rad/sec/C].
-        3.0f * M_PI / 180.0f,       // Limit for model intercept parameter [rad/sec].
-        true);                      // Over-temp compensation enable.
+        5,                         // Min num of points to enable model update
+        5000000000,                // Min model update interval [nsec]
+        0.75f,                     // Temperature span of bin method [C]
+        50.0e-3f * M_PI / 180.0f,  // Model fit tolerance [rad/sec]
+        50.0e-3f * M_PI / 180.0f,  // Outlier rejection tolerance [rad/sec]
+        172800000000000,           // Model data point age limit [nsec]
+        50.0e-3f * M_PI / 180.0f,  // Limit for temp. sensitivity [rad/sec/C]
+        3.0f * M_PI / 180.0f,      // Limit for model intercept [rad/sec]
+        3.0e-3f * M_PI / 180.0f,   // Significant offset change [rad/sec]
+        true);                     // Over-temp compensation enable
 #endif  // OVERTEMPCAL_ENABLED
 #endif  // GYRO_CAL_ENABLED
 
 #ifdef MAG_SLAVE_PRESENT
 #ifdef DIVERSITY_CHECK_ENABLED
- initMagCal(&mTask.moc, 0.0f, 0.0f, 0.0f,  // bias x, y, z
-            1.0f, 0.0f, 0.0f,              // c00, c01, c02
-            0.0f, 1.0f, 0.0f,              // c10, c11, c12
-            0.0f, 0.0f, 1.0f,              // c20, c21, c22
-            8,                             // min_num_diverse_vectors
-            1,                             // max_num_max_distance
-            6.0f,                          // var_threshold
-            10.0f,                         // max_min_threshold
-            48.f,                          // local_field
-            0.5f,                          // threshold_tuning_param
-            2.552);                        // max_distance_tuning_param
+    initMagCal(&mTask.moc,
+               0.0f, 0.0f, 0.0f,   // bias x, y, z
+               1.0f, 0.0f, 0.0f,   // c00, c01, c02
+               0.0f, 1.0f, 0.0f,   // c10, c11, c12
+               0.0f, 0.0f, 1.0f,   // c20, c21, c22
+               3000000,            // min_batch_window_in_micros
+               8,                  // min_num_diverse_vectors
+               1,                  // max_num_max_distance
+               6.0f,               // var_threshold
+               10.0f,              // max_min_threshold
+               48.f,               // local_field
+               0.5f,               // threshold_tuning_param
+               2.552f);            // max_distance_tuning_param
 #else
-    initMagCal(&mTask.moc, 0.0f, 0.0f, 0.0f,  // bias x, y, z
-               1.0f, 0.0f, 0.0f,              // c00, c01, c02
-               0.0f, 1.0f, 0.0f,              // c10, c11, c12
-               0.0f, 0.0f, 1.0f);             // c20, c21, c22
+    initMagCal(&mTask.moc,
+               0.0f, 0.0f, 0.0f,   // bias x, y, z
+               1.0f, 0.0f, 0.0f,   // c00, c01, c02
+               0.0f, 1.0f, 0.0f,   // c10, c11, c12
+               0.0f, 0.0f, 1.0f);  // c20, c21, c22
 #endif
 #endif
 
@@ -4285,6 +4319,7 @@ static bool sendOtcGyroUpdate_(TASK) {
         if (osEnqueueEvtOrFree(EVT_APP_TO_SENSOR_HAL_DATA, // bit-or EVENT_TYPE_BIT_DISCARDABLE
                                                           // to make event discardable
                                p, unlockOtcGyroUpdateBuffer)) {
+            T(otcGyroUpdateBuffer).sendToHostRequest = false;
             ++step;
         }
     }
