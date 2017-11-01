@@ -24,7 +24,7 @@
 namespace android {
 
 #define CONTEXTHUB_SETTINGS_PATH        "/persist/sensorcal.json"
-#define CONTEXTHUB_SAVED_SETTINGS_PATH  "/data/misc/sensorcal_saved.json"
+#define CONTEXTHUB_SAVED_SETTINGS_PATH  "/data/vendor/sensor/sensorcal_saved.json"
 #define MAG_BIAS_FILE_PATH              "/sys/class/power_supply/battery/compass_compensation"
 
 static const uint32_t kMinClockRateHz = 960000;
@@ -81,6 +81,10 @@ enum comms_sensor_t {
     COMMS_SENSOR_ACCEL_BIAS                  = 43,
     COMMS_SENSOR_DOUBLE_TOUCH                = 44,
     COMMS_SENSOR_GAZE                        = 45,
+    COMMS_SENSOR_UNGAZE                      = 46,
+    COMMS_SENSOR_ACCEL_UNCALIBRATED          = 47,
+    COMMS_SENSOR_HUMIDITY                    = 48,
+    COMMS_SENSOR_AMBIENT_TEMPERATURE         = 51,
 
     NUM_COMMS_SENSORS_PLUS_1,
 
@@ -113,6 +117,7 @@ enum {
     SENSOR_TYPE_DOUBLE_TAP              = SENSOR_TYPE_DEVICE_PRIVATE_BASE + 3,
     SENSOR_TYPE_DOUBLE_TOUCH            = SENSOR_TYPE_DEVICE_PRIVATE_BASE + 4,
     SENSOR_TYPE_GAZE                    = SENSOR_TYPE_DEVICE_PRIVATE_BASE + 5,
+    SENSOR_TYPE_UNGAZE                  = SENSOR_TYPE_DEVICE_PRIVATE_BASE + 6,
 };
 
 }  // namespace android
