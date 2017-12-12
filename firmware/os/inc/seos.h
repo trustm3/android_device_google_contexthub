@@ -126,6 +126,12 @@ struct AppEventFreeData { //goes with EVT_APP_FREE_EVT_DATA
     void* evtData;
 };
 
+struct AppEventStartStop {
+    uint64_t appId;
+    uint32_t version;
+    uint16_t tid;
+};
+
 typedef void (*OsDeferCbkF)(void *);
 
 typedef void (*EventFreeF)(void* event);
@@ -174,6 +180,7 @@ bool osDefer(OsDeferCbkF callback, void *cookie, bool urgent);
 bool osTidById(uint64_t *appId, uint32_t *tid);
 bool osAppInfoById(uint64_t appId, uint32_t *appIdx, uint32_t *appVer, uint32_t *appSize);
 bool osAppInfoByIndex(uint32_t appIdx, uint64_t *appId, uint32_t *appVer, uint32_t *appSize);
+bool osExtAppInfoByIndex(uint32_t appIdx, uint64_t *appId, uint32_t *appVer, uint32_t *appSize);
 uint32_t osGetCurrentTid();
 uint32_t osSetCurrentTid(uint32_t);
 
@@ -262,18 +269,21 @@ bool osEraseShared();
 bool osRetainCurrentEvent(TaggedPtr *evtFreeingInfoP); //called from any apps' event handling to retain current event. Only valid for first app that tries. evtFreeingInfoP filled by call and used to free evt later
 void osFreeRetainedEvent(uint32_t evtType, void *evtData, TaggedPtr *evtFreeingInfoP);
 
-uint32_t osExtAppStopApps(uint64_t appId);
-uint32_t osExtAppEraseApps(uint64_t appId);
-uint32_t osExtAppStartApps(uint64_t appId);
+uint32_t osExtAppStopAppsByAppId(uint64_t appId);
+uint32_t osExtAppEraseAppsByAppId(uint64_t appId);
+uint32_t osExtAppStartAppsByAppId(uint64_t appId);
+uint32_t osExtAppStartAppsDelayed();
 
 bool osAppIsChre(uint16_t tid);
+uint32_t osAppChreVersion(uint16_t tid);
 
 /* Logging */
 enum LogLevel {
-    LOG_ERROR = 'E',
-    LOG_WARN  = 'W',
-    LOG_INFO  = 'I',
-    LOG_DEBUG = 'D',
+    LOG_ERROR   = 'E',
+    LOG_WARN    = 'W',
+    LOG_INFO    = 'I',
+    LOG_DEBUG   = 'D',
+    LOG_VERBOSE = 'V',
 };
 
 void osLogv(char clevel, uint32_t flags, const char *str, va_list vl);
